@@ -124,10 +124,7 @@ public:
     bool supportsBWC();
     int getLeftSplit() { return mSplit.left(); }
     int getRightSplit() { return mSplit.right(); }
-    bool isPartialUpdateEnabled() {
-        return mPanelInfo.mPartialUpdateEnable &&
-                mPanelInfo.mType == MIPI_CMD_PANEL;
-    }
+    int isPartialUpdateEnabled() { return mPanelInfo.mPartialUpdateEnable; }
     int getLeftAlign() { return mPanelInfo.mLeftAlign; }
     int getWidthAlign() { return mPanelInfo.mWidthAlign; }
     int getTopAlign() { return mPanelInfo.mTopAlign; }

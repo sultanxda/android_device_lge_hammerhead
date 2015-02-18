@@ -248,6 +248,10 @@ void initContext(hwc_context_t *ctx)
     ctx->mVPUClient = new VPUClient();
 #endif
 
+    ctx->enableABC = false;
+    property_get("debug.sf.hwc.canUseABC", value, "0");
+    ctx->enableABC  = atoi(value) ? true : false;
+
     // Initialize gpu perfomance hint related parameters
     property_get("sys.hwc.gpu_perf_mode", value, "0");
     ctx->mGPUHintInfo.mGpuPerfModeEnable = atoi(value)? true : false;
@@ -257,6 +261,7 @@ void initContext(hwc_context_t *ctx)
     ctx->mGPUHintInfo.mPrevCompositionGLES = false;
     ctx->mGPUHintInfo.mCurrGPUPerfMode = EGL_GPU_LEVEL_0;
     memset(&(ctx->mPtorInfo), 0, sizeof(ctx->mPtorInfo));
+    ctx->mHPDEnabled = false;
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
 }
@@ -790,13 +795,13 @@ void setListStats(hwc_context_t *ctx,
     ctx->listStats[dpy].isSecurePresent = false;
     ctx->listStats[dpy].yuvCount = 0;
     char property[PROPERTY_VALUE_MAX];
-    ctx->listStats[dpy].extOnlyLayerIndex = -1;
     ctx->listStats[dpy].isDisplayAnimating = false;
     ctx->listStats[dpy].roi = ovutils::Dim(0, 0,
                       (int)ctx->dpyAttr[dpy].xres, (int)ctx->dpyAttr[dpy].yres);
     ctx->listStats[dpy].secureUI = false;
     ctx->listStats[dpy].yuv4k2kCount = 0;
     ctx->dpyAttr[dpy].mActionSafePresent = isActionSafePresent(ctx, dpy);
+    ctx->listStats[dpy].renderBufIndexforABC = -1;
 
     trimList(ctx, list, dpy);
     optimizeLayerRects(ctx, list, dpy);
@@ -843,10 +848,6 @@ void setListStats(hwc_context_t *ctx,
         if(layer->blending == HWC_BLENDING_PREMULT)
             ctx->listStats[dpy].preMultipliedAlpha = true;
 
-
-        if(UNLIKELY(isExtOnly(hnd))){
-            ctx->listStats[dpy].extOnlyLayerIndex = i;
-        }
     }
     if(ctx->listStats[dpy].yuvCount > 0) {
         if (property_get("hw.cabl.yuv", property, NULL) > 0) {
@@ -1043,6 +1044,13 @@ hwc_rect_t moveRect(const hwc_rect_t& rect, const int& x_off, const int& y_off)
     res.bottom = rect.bottom + y_off;
 
     return res;
+}
+
+bool operator ==(const hwc_rect_t& lhs, const hwc_rect_t& rhs) {
+    if(lhs.left == rhs.left && lhs.top == rhs.top &&
+       lhs.right == rhs.right &&  lhs.bottom == rhs.bottom )
+          return true ;
+    return false;
 }
 
 /* computes the intersection of two rects */
@@ -1266,11 +1274,20 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     }
 
     for(uint32_t i = 0; i < list->numHwLayers; i++) {
-        if(list->hwLayers[i].compositionType == HWC_OVERLAY &&
+        if(((isAbcInUse(ctx)== true ) ||
+          (list->hwLayers[i].compositionType == HWC_OVERLAY)) &&
                         list->hwLayers[i].acquireFenceFd >= 0) {
             if(UNLIKELY(swapzero))
                 acquireFd[count++] = -1;
-            else
+            // if ABC is enabled for more than one layer.
+            // renderBufIndexforABC will work as FB.Hence
+            // set the acquireFD from fd - which is coming from copybit
+            else if(fd >= 0 && (isAbcInUse(ctx) == true)) {
+                if(ctx->listStats[dpy].renderBufIndexforABC ==(int32_t)i)
+                   acquireFd[count++] = fd;
+                else
+                   continue;
+            } else
                 acquireFd[count++] = list->hwLayers[i].acquireFenceFd;
         }
         if(list->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
@@ -1323,12 +1340,22 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
                 // if animation is in progress.
                 list->hwLayers[i].releaseFenceFd = -1;
             } else if(list->hwLayers[i].releaseFenceFd < 0) {
-                //If rotator has not already populated this field.
-                if(list->hwLayers[i].compositionType == HWC_BLIT) {
-                    //For Blit, the app layers should be released when the Blit is
-                    //complete. This fd was passed from copybit->draw
+#ifdef QCOM_BSP
+                //If rotator has not already populated this field
+                // & if it's a not VPU layer
+
+                // if ABC is enabled for more than one layer
+                if(fd >= 0 && (isAbcInUse(ctx) == true) &&
+                  ctx->listStats[dpy].renderBufIndexforABC !=(int32_t)i){
                     list->hwLayers[i].releaseFenceFd = dup(fd);
-                } else {
+                } else if((list->hwLayers[i].compositionType == HWC_BLIT)&&
+                                               (isAbcInUse(ctx) == false)){
+                    //For Blit, the app layers should be released when the Blit
+                    //is complete. This fd was passed from copybit->draw
+                    list->hwLayers[i].releaseFenceFd = dup(fd);
+                } else 
+#endif
+                {
                     list->hwLayers[i].releaseFenceFd = dup(releaseFd);
                 }
             }
@@ -1436,8 +1463,18 @@ int configRotator(Rotator *rot, Whf& whf,
 
     if (qdutils::MDPVersion::getInstance().getMDPVersion() >=
         qdutils::MDSS_V5) {
-         Dim rotCrop(crop.left, crop.top, crop.right - crop.left,
-                crop.bottom - crop.top);
+        uint32_t crop_w = (crop.right - crop.left);
+        uint32_t crop_h = (crop.bottom - crop.top);
+        if (ovutils::isYuv(whf.format)) {
+            ovutils::normalizeCrop((uint32_t&)crop.left, crop_w);
+            ovutils::normalizeCrop((uint32_t&)crop.top, crop_h);
+            // For interlaced, crop.h should be 4-aligned
+            if ((mdpFlags & ovutils::OV_MDP_DEINTERLACE) && (crop_h % 4))
+                crop_h = ovutils::aligndown(crop_h, 4);
+            crop.right = crop.left + crop_w;
+            crop.bottom = crop.top + crop_h;
+        }
+        Dim rotCrop(crop.left, crop.top, crop_w, crop_h);
         rot->setCrop(rotCrop);
     }
 
@@ -1512,27 +1549,28 @@ int configColorLayer(hwc_context_t *ctx, hwc_layer_1_t *layer,
 }
 
 void updateSource(eTransform& orient, Whf& whf,
-        hwc_rect_t& crop, Rotator *rot) {
-    Dim transformedCrop(crop.left, crop.top,
+        hwc_rect_t& crop) {
+    Dim srcCrop(crop.left, crop.top,
             crop.right - crop.left,
             crop.bottom - crop.top);
+    orient = static_cast<eTransform>(ovutils::getMdpOrient(orient));
+    preRotateSource(orient, whf, srcCrop);
     if (qdutils::MDPVersion::getInstance().getMDPVersion() >=
         qdutils::MDSS_V5) {
-        //B-family rotator internally could modify destination dimensions if
-        //downscaling is supported
-        whf = rot->getDstWhf();
-        transformedCrop = rot->getDstDimensions();
+        // Source for overlay will be the cropped (and rotated)
+        crop.left = 0;
+        crop.top = 0;
+        crop.right = srcCrop.w;
+        crop.bottom = srcCrop.h;
+        // Set width & height equal to sourceCrop w & h
+        whf.w = srcCrop.w;
+        whf.h = srcCrop.h;
     } else {
-        //A-family rotator rotates entire buffer irrespective of crop, forcing
-        //us to recompute the crop based on transform
-        orient = static_cast<eTransform>(ovutils::getMdpOrient(orient));
-        preRotateSource(orient, whf, transformedCrop);
+        crop.left = srcCrop.x;
+        crop.top = srcCrop.y;
+        crop.right = srcCrop.x + srcCrop.w;
+        crop.bottom = srcCrop.y + srcCrop.h;
     }
-
-    crop.left = transformedCrop.x;
-    crop.top = transformedCrop.y;
-    crop.right = transformedCrop.x + transformedCrop.w;
-    crop.bottom = transformedCrop.y + transformedCrop.h;
 }
 
 int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
@@ -1597,7 +1635,8 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        updateSource(orient, whf, crop, *rot);
+        whf.format = (*rot)->getDstFormat();
+        updateSource(orient, whf, crop);
         rotFlags |= ovutils::ROT_PREROTATED;
     }
 
@@ -1703,7 +1742,8 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        updateSource(orient, whf, crop, *rot);
+        whf.format = (*rot)->getDstFormat();
+        updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
     }
 
@@ -1715,17 +1755,14 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
     const int lSplit = getLeftSplit(ctx, dpy);
 
-    // Calculate Left rects
-    if(dst.left < lSplit) {
+    if(lDest != OV_INVALID) {
         tmp_cropL = crop;
         tmp_dstL = dst;
         hwc_rect_t scissor = {0, 0, lSplit, hw_h };
         scissor = getIntersection(ctx->mViewFrame[dpy], scissor);
         qhwc::calculate_crop_rects(tmp_cropL, tmp_dstL, scissor, 0);
     }
-
-    // Calculate Right rects
-    if(dst.right > lSplit) {
+    if(rDest != OV_INVALID) {
         tmp_cropR = crop;
         tmp_dstR = dst;
         hwc_rect_t scissor = {lSplit, 0, hw_w, hw_h };
@@ -1738,8 +1775,8 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     //When buffer is H-flipped, contents of mixer config also needs to swapped
     //Not needed if the layer is confined to one half of the screen.
     //If rotator has been used then it has also done the flips, so ignore them.
-    if((orient & OVERLAY_TRANSFORM_FLIP_H) && (dst.left < lSplit) &&
-            (dst.right > lSplit) && (*rot) == NULL) {
+    if((orient & OVERLAY_TRANSFORM_FLIP_H) && lDest != OV_INVALID
+            && rDest != OV_INVALID && (*rot) == NULL) {
         hwc_rect_t new_cropR;
         new_cropR.left = tmp_cropL.left;
         new_cropR.right = new_cropR.left + (tmp_cropR.right - tmp_cropR.left);
@@ -1830,14 +1867,13 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
         ctx->mLayerRotMap[dpy]->add(layer, *rot);
-        if(!dpy)
-            BwcPM::setBwc(ctx, crop, dst, transform, mdpFlagsL);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        updateSource(orient, whf, crop, *rot);
+        whf.format = (*rot)->getDstFormat();
+        updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
     }
 
@@ -1970,6 +2006,10 @@ void dumpBuffer(private_handle_t *ohnd, char *bufferName) {
         ALOGD("Buffer[%s] Dump to %s: %s",
         bufferName, dumpFilename, bResult ? "Success" : "Fail");
     }
+}
+
+bool isAbcInUse(hwc_context_t *ctx){
+  return (ctx->enableABC && ctx->listStats[0].renderBufIndexforABC == 0);
 }
 
 bool isGLESComp(hwc_context_t *ctx,

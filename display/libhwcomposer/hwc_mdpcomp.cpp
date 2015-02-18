@@ -114,13 +114,9 @@ bool MDPComp::init(hwc_context_t *ctx) {
             sDebugLogs = true;
     }
 
-    // We read from drivers if panel supports partial updating
-    // and we enable partial update computations if supported.
-    // Keeping this property to disable partial update for
-    // debugging by setting below property to 0 & only 0.
-    property_get("persist.hwc.partialupdate", property, "-1");
-    if((atoi(property) != 0) &&
-        qdutils::MDPVersion::getInstance().isPartialUpdateEnabled()) {
+    if(property_get("persist.hwc.partialupdate", property, NULL) > 0) {
+        if((atoi(property) != 0) && ctx->mMDP.panel == MIPI_CMD_PANEL &&
+           qdutils::MDPVersion::getInstance().is8x74v2())
             sEnablePartialFrameUpdate = true;
     }
     ALOGE_IF(isDebug(), "%s: Partial Update applicable?: %d",__FUNCTION__,
@@ -234,12 +230,11 @@ void MDPComp::setRedraw(hwc_context_t *ctx,
 }
 
 MDPComp::FrameInfo::FrameInfo() {
-    memset(&mdpToLayer, 0, sizeof(mdpToLayer));
     reset(0);
 }
 
 void MDPComp::FrameInfo::reset(const int& numLayers) {
-    for(int i = 0; i < MAX_PIPES_PER_MIXER; i++) {
+    for(int i = 0 ; i < MAX_PIPES_PER_MIXER && numLayers; i++ ) {
         if(mdpToLayer[i].pipeInfo) {
             delete mdpToLayer[i].pipeInfo;
             mdpToLayer[i].pipeInfo = NULL;
@@ -1091,6 +1086,11 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
 
     if(!postHeuristicsHandling(ctx, list)) {
         ALOGD_IF(isDebug(), "post heuristic handling failed");
+        if(errno == ENOBUFS) {
+            ALOGD_IF(isDebug(), "SMP Allocation failed");
+            //On SMP allocation failure in video only comp add padding round
+            ctx->isPaddingRound = true;
+        }
         reset(ctx);
         return false;
     }
