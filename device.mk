@@ -379,6 +379,9 @@ endif
 # QCOM display HAL
 $(call project-set-path,qcom-display,device/lge/hammerhead/display)
 
+# QCOM media HAL
+$(call project-set-path,qcom-media,device/lge/hammerhead/media)
+
 # setup dalvik vm configs.
 $(call inherit-product, frameworks/native/build/phone-xhdpi-2048-dalvik-heap.mk)
 
